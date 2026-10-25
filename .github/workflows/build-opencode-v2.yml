@@ -1,0 +1,284 @@
+name: build-opencode-v2-penryn
+
+on:
+  workflow_dispatch:
+    inputs:
+      opencode_ref:
+        description: OpenCode branch/ref to build (default 2.0)
+        required: false
+        default: "2.0"
+      bun_url:
+        description: Penryn Bun archive URL
+        required: false
+        default: ""
+      bun_sha256:
+        description: SHA256 of Bun archive
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  actions: write
+
+env:
+  OPENCODE_REF: ${{ github.event.inputs.opencode_ref }}
+  BUN_URL: ${{ github.event.inputs.bun_url }}
+  BUN_SHA256: ${{ github.event.inputs.bun_sha256 }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve OpenCode v2 version
+        id: tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REF="${OPENCODE_REF:-2.0}"
+          SHA=$(curl -fsSL --connect-timeout 20 --max-time 900 -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/anomalyco/opencode/branches/${REF}" \
+            | grep -oP '"sha":\s*"\K[0-9a-f]{40}' | head -1)
+          [ -n "$SHA" ] || { echo "Failed to resolve ref $REF"; exit 1; }
+          PKGVER=$(curl -fsSL --connect-timeout 20 --max-time 900 \
+            "https://raw.githubusercontent.com/anomalyco/opencode/${SHA}/packages/opencode/package.json" \
+            | grep -oP '"version":\s*"\K[^"]+' | head -1)
+          [ -n "$PKGVER" ] || { echo "Failed to read package.json version"; exit 1; }
+          VERSION="2.0-${PKGVER}-${SHA:0:7}"
+          echo "ref=$REF" >> $GITHUB_OUTPUT
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Using OpenCode ref $REF @ ${SHA:0:7} (version $VERSION)"
+
+      - name: Restore intermediate build
+        id: restore
+        uses: dawidd6/action-download-artifact@v6
+        continue-on-error: true
+        with:
+          workflow: build-opencode-v2.yml
+          name: stage-opencode-v2-linux-x64-${{ steps.tag.outputs.version }}-${{ hashFiles('.github/workflows/build-opencode-v2.yml') }}
+          path: /tmp/stage
+          if_no_artifact_found: warn
+
+      - name: Restore Bun archive cache
+        id: bun-dl-cache
+        if: steps.restore.outputs.found_artifact != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/bun-dl-cache.tar.gz
+          key: dl-bun-linux-${{ env.BUN_SHA256 }}
+
+      - name: Download Bun
+        if: steps.restore.outputs.found_artifact != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          [ -n "$BUN_URL" ] || { echo "BUN_URL is required"; exit 1; }
+          if [ -n "$BUN_SHA256" ] && [ -s /tmp/bun-dl-cache.tar.gz ] && echo "$BUN_SHA256  /tmp/bun-dl-cache.tar.gz" | sha256sum -c --quiet; then
+            echo "Bun archive restored from cache"
+            cp /tmp/bun-dl-cache.tar.gz /tmp/bun.tar.gz
+          else
+          for i in 1 2 3; do
+            if curl -fsSL --connect-timeout 20 --max-time 900 -H "Authorization: token $GH_TOKEN" "$BUN_URL" -o /tmp/bun.tar.gz 2>/dev/null && [ -s /tmp/bun.tar.gz ]; then break; fi
+            if curl -fsSL --connect-timeout 20 --max-time 900 "$BUN_URL" -o /tmp/bun.tar.gz && [ -s /tmp/bun.tar.gz ]; then break; fi
+            [ $i -lt 3 ] && sleep 10
+          done
+          if [ ! -s /tmp/bun.tar.gz ]; then
+            REPO=$(echo "$BUN_URL" | sed -E 's|https://github.com/([^/]+/[^/]+)/releases/download/.*|\1|')
+            TAG=$(echo "$BUN_URL" | sed -E 's|.*/releases/download/([^/]+)/.*|\1|')
+            FILE=$(basename "$BUN_URL")
+            echo "Direct download failed, trying gh release download for $REPO $TAG $FILE"
+            gh release download "$TAG" --repo "$REPO" --pattern "$FILE" --dir /tmp --clobber 2>&1 || true
+            [ -f "/tmp/$FILE" ] && mv "/tmp/$FILE" /tmp/bun.tar.gz
+          fi
+          [ -s /tmp/bun.tar.gz ] || { echo "Bun download failed: $BUN_URL"; exit 1; }
+          if [ -n "$BUN_SHA256" ]; then
+            echo "$BUN_SHA256  /tmp/bun.tar.gz" | sha256sum -c
+            cp /tmp/bun.tar.gz /tmp/bun-dl-cache.tar.gz
+          fi
+          fi
+
+      - name: Save Bun archive cache
+        if: steps.restore.outputs.found_artifact != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/bun-dl-cache.tar.gz
+          key: dl-bun-linux-${{ env.BUN_SHA256 }}
+
+      - name: Setup Penryn Bun
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          mkdir -p /tmp/bun-extract
+          tar xzf /tmp/bun.tar.gz -C /tmp/bun-extract
+          if [ -f /tmp/bun-extract/bun.bin ]; then
+            sudo mkdir -p /opt/bun
+            sudo cp -r /tmp/bun-extract/* /opt/bun/
+          else
+            EXTRACTED=$(ls -d /tmp/bun-extract/*/ 2>/dev/null | head -1 || true)
+            if [ -n "$EXTRACTED" ]; then
+              sudo cp -r "$EXTRACTED" /opt/bun
+              if [ ! -f /opt/bun/bun.bin ] && [ -f /tmp/bun-extract/bun.bin ]; then
+                sudo cp /tmp/bun-extract/bun* /opt/bun/ 2>/dev/null || true
+              fi
+              if [ ! -d /opt/bun/lib ] && [ -d /tmp/bun-extract/lib ]; then
+                sudo cp -r /tmp/bun-extract/lib /opt/bun/ 2>/dev/null || true
+              fi
+            else
+              sudo mkdir -p /opt/bun
+              sudo cp -r /tmp/bun-extract/* /opt/bun/
+            fi
+          fi
+          if [ ! -f /opt/bun/bun.bin ] && [ -f /tmp/bun-extract/bun-release/bun.bin ]; then
+            sudo cp -r /tmp/bun-extract/bun-release/* /opt/bun/ 2>/dev/null || true
+          fi
+          ls -lh /opt/bun/ 2>&1 | head -10
+          printf '#!/bin/bash\nDIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"\nexport LD_LIBRARY_PATH="$DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"\nexec "$DIR/bun.bin" "$@"\n' | sudo tee /opt/bun/bun > /dev/null
+          sudo chmod +x /opt/bun/bun /opt/bun/bun.bin
+          echo "/opt/bun" >> $GITHUB_PATH
+
+      - name: Restore source cache
+        id: src-cache
+        if: steps.restore.outputs.found_artifact != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/opencode
+          key: src-opencode-v2-linux-${{ steps.tag.outputs.sha }}
+
+      - name: Clone OpenCode (v2 branch)
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          DIR="${{ github.workspace }}/opencode"
+          REF="${{ steps.tag.outputs.ref }}"
+          if [ -d "$DIR/.git" ]; then
+            echo "reusing cached opencode source"
+            cd "$DIR"
+            git fetch --depth 1 origin "$REF" || {
+              echo "fetch failed, recloning"
+              rm -rf "$DIR"
+              git clone --depth 1 --branch "$REF" \
+                https://github.com/anomalyco/opencode.git "$DIR"
+              cd "$DIR"
+            }
+          else
+            rm -rf "$DIR"
+            for i in 1 2 3; do
+              git clone --depth 1 --branch "$REF" \
+                https://github.com/anomalyco/opencode.git "$DIR" && break
+              [ $i -lt 3 ] && sleep 10
+            done
+          fi
+          [ -d "$DIR/.git" ] || exit 1
+          cd "$DIR"
+          git fetch --depth 1 origin "${{ steps.tag.outputs.sha }}" 2>/dev/null || true
+          git checkout FETCH_HEAD 2>/dev/null || git checkout "${{ steps.tag.outputs.sha }}" || exit 1
+          rm -rf packages/opencode/dist
+
+      - name: Save source cache
+        if: steps.restore.outputs.found_artifact != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/opencode
+          key: src-opencode-v2-linux-${{ steps.tag.outputs.sha }}
+
+      - name: Install deps
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          pip3 install -q gyp-next
+          cd "${{ github.workspace }}/opencode"
+          bun install --frozen-lockfile
+        env:
+          LD_LIBRARY_PATH: /opt/bun/lib
+
+      - name: Build OpenCode v2 CLI
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          cd "${{ github.workspace }}/opencode/packages/opencode"
+          bun run build --single --skip-install --skip-embed-web-ui
+        env:
+          LD_LIBRARY_PATH: /opt/bun/lib
+          OPENCODE_VERSION: "${{ steps.tag.outputs.version }}"
+
+      - name: Stage built binary
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          BIN=$(find "${{ github.workspace }}/opencode/packages/opencode/dist" -type f -name opencode 2>/dev/null | head -1 || true)
+          [ -n "$BIN" ] || { echo "Binary not found"; exit 1; }
+          mkdir -p /tmp/stage/lib
+          cp "$BIN" /tmp/stage/opencode.bin
+          cp /opt/bun/lib/libicui18n.so.74 /tmp/stage/lib/
+          cp /opt/bun/lib/libicuuc.so.74 /tmp/stage/lib/
+          cp /opt/bun/lib/libicudata.so.74 /tmp/stage/lib/
+          cp /opt/bun/lib/libstdc++.so.6 /tmp/stage/lib/
+          cp /opt/bun/lib/libgcc_s.so.1 /tmp/stage/lib/
+
+      - name: Upload intermediate build
+        if: steps.restore.outputs.found_artifact != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage-opencode-v2-linux-x64-${{ steps.tag.outputs.version }}-${{ hashFiles('.github/workflows/build-opencode-v2.yml') }}
+          path: /tmp/stage
+
+      - name: Use restored build
+        if: steps.restore.outputs.found_artifact == 'true'
+        run: |
+          [ -f /tmp/stage/opencode.bin ] || { echo "restored opencode.bin missing"; ls -la /tmp/stage; exit 1; }
+          [ -f /tmp/stage/lib/libicuuc.so.74 ] || { echo "restored libs missing"; ls -la /tmp/stage/lib; exit 1; }
+
+      - name: Static ISA verify
+        run: |
+          BIN=/tmp/stage/opencode.bin
+          [ -f "$BIN" ] || { echo "staged binary not found"; exit 1; }
+          objdump -d "$BIN" > /tmp/disasm.txt 2>/dev/null
+          echo "=== Instruction counts ==="
+          for pat in "popcnt" "vpopcntq" "vaes" "vzeroupper" "vpbroadcast" "vmovdqa\|vmovdqu"; do
+            echo "$pat: $(grep -c "\b$pat" /tmp/disasm.txt)"
+          done
+          echo "=== POPCNT check (must be 0) ==="
+          if grep -qE '\bpopcnt\b' /tmp/disasm.txt; then
+            echo "ERROR: POPCNT instructions present in binary"
+            grep -nE '\bpopcnt\b' /tmp/disasm.txt | head -10
+            exit 1
+          fi
+          echo "OK: zero POPCNT instructions"
+
+      - name: Bundle libs + wrapper
+        run: |
+          mkdir -p /tmp/bundle/bin /tmp/bundle/lib
+          cp /tmp/stage/opencode.bin /tmp/bundle/bin/opencode.bin
+          cp /tmp/stage/lib/* /tmp/bundle/lib/
+          printf '#!/bin/bash\nDIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"\nexport LD_LIBRARY_PATH="$DIR/../lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"\nexec "$DIR/opencode.bin" "$@"\n' > /tmp/bundle/bin/opencode
+          chmod +x /tmp/bundle/bin/opencode /tmp/bundle/bin/opencode.bin
+          LD_LIBRARY_PATH= /tmp/bundle/bin/opencode --version
+
+      - name: Package artifact
+        run: |
+          mkdir -p /tmp/pkg
+          cp -r /tmp/bundle /tmp/pkg/opencode-v2-penryn
+          tar czf /tmp/opencode-v2-penryn-linux-x64.tar.gz -C /tmp/pkg opencode-v2-penryn
+
+      - name: Compute SHA256
+        id: sha256
+        run: |
+          SHA=$(sha256sum /tmp/opencode-v2-penryn-linux-x64.tar.gz | cut -d' ' -f1)
+          echo "sha256=$SHA" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: opencode-v2-penryn-${{ steps.tag.outputs.version }}-${{ github.run_id }}
+          name: OpenCode v2 Penryn ${{ steps.tag.outputs.version }} (ref ${{ steps.tag.outputs.ref }})
+          body: |
+            OpenCode branch `${{ steps.tag.outputs.ref }}` @ ${{ steps.tag.outputs.sha }} (version ${{ steps.tag.outputs.version }}) built for Penryn (SSE 4.1)
+            SHA256: ${{ steps.sha256.outputs.sha256 }}
+          files: /tmp/opencode-v2-penryn-linux-x64.tar.gz
+          draft: false
+          prerelease: false
+
+      - name: Upload artifact (backup)
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-v2-penryn-linux-x64
+          path: /tmp/opencode-v2-penryn-linux-x64.tar.gz
