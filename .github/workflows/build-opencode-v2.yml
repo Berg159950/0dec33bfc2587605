@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       opencode_ref:
-        description: OpenCode branch/ref to build (default 2.0)
+        description: 'OpenCode ref to build: "latest" (default, highest released v2.x tag), an explicit tag like v2.1.4, or a branch'
         required: false
-        default: "2.0"
+        default: "latest"
       bun_url:
         description: Penryn Bun archive URL
         required: false
@@ -36,16 +36,36 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          REF="${OPENCODE_REF:-2.0}"
-          SHA=$(curl -fsSL --connect-timeout 20 --max-time 900 -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/anomalyco/opencode/branches/${REF}" \
-            | grep -oP '"sha":\s*"\K[0-9a-f]{40}' | head -1)
+          REF="${OPENCODE_REF:-latest}"
+          if [ "$REF" = "latest" ]; then
+            # pick the highest released v2.x tag (not an intermediate dev commit)
+            REF=$(git ls-remote --tags https://github.com/anomalyco/opencode.git "v2.*" \
+              | sed -E 's|.*refs/tags/||' | grep -v '\^{}' | sort -V | tail -1)
+            [ -n "$REF" ] || { echo "Failed to list v2.x tags"; exit 1; }
+            echo "Resolved latest released tag: $REF"
+          fi
+          SHA=$(git ls-remote https://github.com/anomalyco/opencode.git "refs/tags/${REF}" "refs/tags/${REF}^{}" \
+            | awk '{print $1}' | tail -1)
           [ -n "$SHA" ] || { echo "Failed to resolve ref $REF"; exit 1; }
+          # 2.x (dev branch) keeps package.json at the repo root with the CLI in packages/cli;
+          # the legacy 2.0 branch has it in packages/opencode
           PKGVER=$(curl -fsSL --connect-timeout 20 --max-time 900 \
-            "https://raw.githubusercontent.com/anomalyco/opencode/${SHA}/packages/opencode/package.json" \
+            "https://raw.githubusercontent.com/anomalyco/opencode/${SHA}/package.json" \
             | grep -oP '"version":\s*"\K[^"]+' | head -1)
+          LAYOUT=cli
+          if [ -z "$PKGVER" ]; then
+            LAYOUT=opencode
+            PKGVER=$(curl -fsSL --connect-timeout 20 --max-time 900 \
+              "https://raw.githubusercontent.com/anomalyco/opencode/${SHA}/packages/opencode/package.json" \
+              | grep -oP '"version":\s*"\K[^"]+' | head -1)
+          fi
           [ -n "$PKGVER" ] || { echo "Failed to read package.json version"; exit 1; }
-          VERSION="2.0-${PKGVER}-${SHA:0:7}"
+          if [ "$LAYOUT" = "opencode" ]; then
+            VERSION="2.0-${PKGVER}-${SHA:0:7}"
+          else
+            VERSION="${PKGVER}-${SHA:0:7}"
+          fi
+          echo "layout=$LAYOUT" >> $GITHUB_OUTPUT
           echo "ref=$REF" >> $GITHUB_OUTPUT
           echo "sha=$SHA" >> $GITHUB_OUTPUT
           echo "version=$VERSION" >> $GITHUB_OUTPUT
@@ -172,8 +192,8 @@ jobs:
           [ -d "$DIR/.git" ] || exit 1
           cd "$DIR"
           git fetch --depth 1 origin "${{ steps.tag.outputs.sha }}" 2>/dev/null || true
-          git checkout FETCH_HEAD 2>/dev/null || git checkout "${{ steps.tag.outputs.sha }}" || exit 1
-          rm -rf packages/opencode/dist
+          git checkout FETCH_HEAD 2>/dev/null || git checkout "${{ steps.tag.outputs.sha }}" 2>/dev/null || git checkout "${{ steps.tag.outputs.ref }}" || exit 1
+          rm -rf packages/cli/dist packages/opencode/dist
 
       - name: Save source cache
         if: steps.restore.outputs.found_artifact != 'true'
@@ -195,8 +215,10 @@ jobs:
       - name: Build OpenCode v2 CLI
         if: steps.restore.outputs.found_artifact != 'true'
         run: |
-          cd "${{ github.workspace }}/opencode/packages/opencode"
-          bun run build --single --skip-install --skip-embed-web-ui
+          cd "${{ github.workspace }}/opencode/packages/${{ steps.tag.outputs.layout }}"
+          EXTRA_FLAGS=""
+          [ "${{ steps.tag.outputs.layout }}" = "cli" ] && EXTRA_FLAGS="--skip-web-ui"
+          bun run build --single --skip-install $EXTRA_FLAGS
         env:
           LD_LIBRARY_PATH: /opt/bun/lib
           OPENCODE_VERSION: "${{ steps.tag.outputs.version }}"
@@ -204,7 +226,7 @@ jobs:
       - name: Stage built binary
         if: steps.restore.outputs.found_artifact != 'true'
         run: |
-          BIN=$(find "${{ github.workspace }}/opencode/packages/opencode/dist" -type f -name opencode 2>/dev/null | head -1 || true)
+          BIN=$(find "${{ github.workspace }}/opencode/packages/${{ steps.tag.outputs.layout }}/dist" -type f -name opencode 2>/dev/null | head -1 || true)
           [ -n "$BIN" ] || { echo "Binary not found"; exit 1; }
           mkdir -p /tmp/stage/lib
           cp "$BIN" /tmp/stage/opencode.bin
